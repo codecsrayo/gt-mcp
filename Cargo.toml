@@ -1,5 +1,5 @@
 [package]
-name = "gt-mcp-cli"
+name = "gt-mcp"
 version = "0.1.0"
 edition = "2021"
 description = "Simple CLI to invoke gt-core MCP tools over Streamable HTTP (SSE handshake)"
