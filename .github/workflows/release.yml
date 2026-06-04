@@ -11,7 +11,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  ASSET: gtmcp-x86_64-unknown-linux-gnu
+  ASSET: gtmcp-x86_64-unknown-linux-musl
 
 jobs:
   build:
@@ -19,13 +19,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build release binary
-        run: cargo build --release --locked
+      # Static musl build: runs on any glibc (incl. older 2.33). No native TLS,
+      # so the binary is fully self-contained — no musl-gcc needed.
+      - name: Build static release binary
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl
 
       - name: Stage asset
-        run: install -m 0755 target/release/gtmcp "$ASSET"
+        run: install -m 0755 target/x86_64-unknown-linux-musl/release/gtmcp "$ASSET"
 
       # Versioned tag push -> attach binary to that release (clobber if re-run).
       - name: Upload to tagged release

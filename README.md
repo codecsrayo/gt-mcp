@@ -32,6 +32,15 @@ cargo build --release
 # binary: target/release/gtmcp
 ```
 
+Release assets are built **static (musl)** so they run on any glibc — including
+older systems (e.g. glibc 2.33) where a glibc-linked build fails with
+`version 'GLIBC_2.34' not found`. To reproduce locally:
+
+```sh
+rustup target add x86_64-unknown-linux-musl
+cargo build --release --target x86_64-unknown-linux-musl
+```
+
 ## Config (env or flags)
 
 | Flag | Env | Default |
