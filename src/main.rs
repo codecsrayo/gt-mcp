@@ -132,14 +132,20 @@ impl Mcp {
             .http
             .post(&self.url)
             .header("Content-Type", "application/json")
-            .header("Accept", "application/json, text/event-stream")
-            .header("X-Actor", &self.actor)
-            .header("X-Workspace", &self.workspace);
-        // Present the access JWT both ways so the server takes whichever it reads (hq-mcp-cookie-auth).
+            .header("Accept", "application/json, text/event-stream");
+        // Authenticated: present the access JWT both ways (Authorization + gt_web_token cookie) and
+        // let the token's claim be the authoritative actor/workspace. We must NOT also send
+        // X-Workspace — in JWT mode a header that disagrees with the claim trips the server's
+        // cross-workspace leak gate and the call is rejected.
         if let Some(t) = &self.token {
             req = req
                 .header("Authorization", format!("Bearer {t}"))
                 .header("Cookie", format!("gt_web_token={t}"));
+        } else {
+            // Anonymous (server with auth disabled): identify by the legacy headers.
+            req = req
+                .header("X-Actor", &self.actor)
+                .header("X-Workspace", &self.workspace);
         }
         if let Some(s) = &self.session {
             req = req.header("Mcp-Session-Id", s);
