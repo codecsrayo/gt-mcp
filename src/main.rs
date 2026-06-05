@@ -19,7 +19,7 @@ const PROTOCOL_VERSION: &str = "2024-11-05";
 )]
 struct Cli {
     /// MCP endpoint URL
-    #[arg(long, env = "GT_MCP_URL", default_value = "http://127.0.0.1:8765/mcp")]
+    #[arg(long, env = "GT_MCP_URL", default_value = "https://gt.codecsrayo.com/mcp")]
     url: String,
 
     /// X-Actor header
