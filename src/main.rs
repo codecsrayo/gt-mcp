@@ -3,9 +3,15 @@
 //! Each invocation is one stateless session: it performs the MCP `initialize`
 //! handshake (capturing `Mcp-Session-Id`), sends `notifications/initialized`,
 //! then issues the requested call and prints the JSON-RPC `result`.
+//!
+//! Auth (hq-mcp-cookie-auth): `gtmcp login` authenticates once against `/auth/login` and
+//! persists the access+refresh tokens under `~/.config/gt-mcp/session.json` (0600). Every later
+//! call attaches the access JWT as both `Authorization: Bearer` and the `gt_web_token` cookie,
+//! auto-refreshing a near-expired access token via `/auth/refresh` — so you don't re-login each run.
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::Read;
 
@@ -40,6 +46,17 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Authenticate and persist a session (no re-login per run): gtmcp login -e a@b.com -p ***
+    Login {
+        /// Account email
+        #[arg(short, long, env = "GT_MCP_EMAIL")]
+        email: String,
+        /// Account password (or set GT_MCP_PASSWORD)
+        #[arg(short, long, env = "GT_MCP_PASSWORD")]
+        password: String,
+    },
+    /// Revoke the refresh token and delete the local session
+    Logout,
     /// Call a tool: gtmcp call <tool> '<json-args>'  (args from positional, --file, or stdin via '-')
     Call {
         /// Tool name, e.g. issues_create_execute
@@ -69,17 +86,28 @@ enum Cmd {
     },
 }
 
+/// Persisted login session (under ~/.config/gt-mcp/session.json, mode 0600).
+#[derive(Serialize, Deserialize)]
+struct Session {
+    access_token: String,
+    refresh_token: String,
+    /// Epoch seconds the access token expires at (now + expires_in at issue/refresh time).
+    access_exp: u64,
+}
+
 struct Mcp {
     http: reqwest::blocking::Client,
     url: String,
     actor: String,
     workspace: String,
+    /// Access JWT attached to every call (Authorization: Bearer + gt_web_token cookie).
+    token: Option<String>,
     session: Option<String>,
     next_id: i64,
 }
 
 impl Mcp {
-    fn new(cli: &Cli) -> Result<Self> {
+    fn new(cli: &Cli, token: Option<String>) -> Result<Self> {
         Ok(Self {
             http: reqwest::blocking::Client::builder()
                 .build()
@@ -87,6 +115,7 @@ impl Mcp {
             url: cli.url.clone(),
             actor: cli.actor.clone(),
             workspace: cli.workspace.clone(),
+            token,
             session: None,
             next_id: 0,
         })
@@ -106,6 +135,12 @@ impl Mcp {
             .header("Accept", "application/json, text/event-stream")
             .header("X-Actor", &self.actor)
             .header("X-Workspace", &self.workspace);
+        // Present the access JWT both ways so the server takes whichever it reads (hq-mcp-cookie-auth).
+        if let Some(t) = &self.token {
+            req = req
+                .header("Authorization", format!("Bearer {t}"))
+                .header("Cookie", format!("gt_web_token={t}"));
+        }
         if let Some(s) = &self.session {
             req = req.header("Mcp-Session-Id", s);
         }
@@ -234,9 +269,151 @@ fn emit(v: &Value, compact: bool) -> Result<()> {
     Ok(())
 }
 
+// ---- auth/session ---------------------------------------------------------------------------
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The auth surface base — the MCP `--url` with its trailing `/mcp` path stripped
+/// (`/auth/*` lives at the server root, not under `/mcp`).
+fn auth_base(url: &str) -> String {
+    url.strip_suffix("/mcp")
+        .unwrap_or(url)
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn session_path() -> Result<std::path::PathBuf> {
+    let home = std::env::var("HOME").context("HOME unset")?;
+    Ok(std::path::Path::new(&home).join(".config/gt-mcp/session.json"))
+}
+
+fn load_session() -> Option<Session> {
+    let path = session_path().ok()?;
+    let raw = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn save_session(s: &Session) -> Result<()> {
+    let path = session_path()?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).context("create ~/.config/gt-mcp")?;
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(s)?).context("write session")?;
+    // Tokens are secrets — owner-only.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .context("chmod 600 session")?;
+    }
+    Ok(())
+}
+
+fn clear_session() -> Result<()> {
+    if let Ok(path) = session_path() {
+        let _ = std::fs::remove_file(path);
+    }
+    Ok(())
+}
+
+/// Map an `/auth/login` or `/auth/refresh` JSON body into a [`Session`].
+fn to_session(v: &Value) -> Result<Session> {
+    let access = v
+        .get("access_token")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| anyhow!("response has no access_token: {v}"))?
+        .to_string();
+    let refresh = v
+        .get("refresh_token")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let expires_in = v.get("expires_in").and_then(|x| x.as_u64()).unwrap_or(900);
+    Ok(Session {
+        access_token: access,
+        refresh_token: refresh,
+        access_exp: now_secs() + expires_in,
+    })
+}
+
+fn auth_post(base: &str, path: &str, body: &Value) -> Result<Value> {
+    let c = reqwest::blocking::Client::new();
+    let resp = c
+        .post(format!("{base}{path}"))
+        .header("Content-Type", "application/json")
+        .json(body)
+        .send()
+        .with_context(|| format!("POST {base}{path}"))?;
+    let status = resp.status();
+    let text = resp.text().unwrap_or_default();
+    if !status.is_success() {
+        bail!("{path} HTTP {status}: {text}");
+    }
+    serde_json::from_str(&text).with_context(|| format!("parse {path} body: {text}"))
+}
+
+fn login(base: &str, email: &str, password: &str) -> Result<Session> {
+    let v = auth_post(base, "/auth/login", &json!({"email": email, "password": password}))?;
+    to_session(&v)
+}
+
+fn refresh(base: &str, s: &Session) -> Result<Session> {
+    let v = auth_post(base, "/auth/refresh", &json!({"refresh_token": s.refresh_token}))?;
+    to_session(&v)
+}
+
+/// Resolve the access token to attach to MCP calls: load the saved session, refreshing it when
+/// the access token is within 30s of expiry. `None` when no session exists (anonymous — works
+/// only against a server with auth disabled).
+fn ensure_access(base: &str) -> Result<Option<String>> {
+    let Some(mut s) = load_session() else {
+        return Ok(None);
+    };
+    if s.access_exp <= now_secs() + 30 {
+        match refresh(base, &s) {
+            Ok(ns) => {
+                save_session(&ns)?;
+                s = ns;
+            }
+            Err(e) => {
+                let _ = clear_session();
+                bail!("session expired and refresh failed ({e}); run `gtmcp login`");
+            }
+        }
+    }
+    Ok(Some(s.access_token))
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let mut mcp = Mcp::new(&cli)?;
+    let base = auth_base(&cli.url);
+
+    // Auth commands short-circuit the MCP handshake.
+    match &cli.cmd {
+        Cmd::Login { email, password } => {
+            let s = login(&base, email, password)?;
+            save_session(&s)?;
+            eprintln!("logged in as {email}; session saved to ~/.config/gt-mcp/session.json");
+            return Ok(());
+        }
+        Cmd::Logout => {
+            if let Some(s) = load_session() {
+                let _ = auth_post(&base, "/auth/logout", &json!({"refresh_token": s.refresh_token}));
+            }
+            clear_session()?;
+            eprintln!("logged out; session cleared");
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    let token = ensure_access(&base)?;
+    let mut mcp = Mcp::new(&cli, token)?;
     mcp.initialize().context("MCP initialize handshake")?;
 
     let result = match &cli.cmd {
@@ -272,6 +449,8 @@ fn main() -> Result<()> {
             let p = read_args(params, &None)?;
             mcp.rpc(method, p)?
         }
+        // Handled above.
+        Cmd::Login { .. } | Cmd::Logout => unreachable!(),
     };
 
     emit(&result, cli.compact)
